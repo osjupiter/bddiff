@@ -54,8 +54,17 @@ type hashResult struct {
 
 // --- block reading: produces chan block ---
 
-// readBlocksFromFile reads blocks using parallel ReadAt and sends them to a channel.
-func readBlocksFromFile(path string, blockSize int64, workers int) (chan block, int64) {
+// readBlocks returns a channel of blocks and a function to get the total file size.
+// The size func must be called after the channel is drained.
+// path="-" reads from stdin; otherwise parallel ReadAt from file.
+func readBlocks(path string, blockSize int64, workers int) (chan block, func() int64) {
+	if path == "-" {
+		return readBlocksFromStream(os.Stdin, blockSize)
+	}
+	return readBlocksFromFile(path, blockSize, workers)
+}
+
+func readBlocksFromFile(path string, blockSize int64, workers int) (chan block, func() int64) {
 	fi, err := os.Stat(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -65,7 +74,6 @@ func readBlocksFromFile(path string, blockSize int64, workers int) (chan block, 
 	totalBlocks := (fileSize + blockSize - 1) / blockSize
 	ch := make(chan block, workers*2)
 
-	// Dispatch index-only jobs to reader workers, who ReadAt and send blocks
 	type job struct{ index, offset, size int64 }
 	jobs := make(chan job, workers*2)
 
@@ -102,11 +110,10 @@ func readBlocksFromFile(path string, blockSize int64, workers int) (chan block, 
 		close(ch)
 	}()
 
-	return ch, fileSize
+	return ch, func() int64 { return fileSize }
 }
 
-// readBlocksFromStream reads blocks sequentially from an io.Reader.
-func readBlocksFromStream(r io.Reader, blockSize int64) (chan block, chan int64) {
+func readBlocksFromStream(r io.Reader, blockSize int64) (chan block, func() int64) {
 	ch := make(chan block, 16)
 	done := make(chan int64, 1)
 
@@ -128,7 +135,7 @@ func readBlocksFromStream(r io.Reader, blockSize int64) (chan block, chan int64)
 		done <- fileSize
 	}()
 
-	return ch, done
+	return ch, func() int64 { return <-done }
 }
 
 // --- hash pipeline: consumes chan block, produces []hashResult ---
@@ -304,22 +311,12 @@ var digestCmd = &cobra.Command{
 		path := args[0]
 		start := time.Now()
 
-		var blocks chan block
-		var fileSize int64
+		blocks, getSize := readBlocks(path, digestBS, digestWorkers)
+		results := hashBlocks(blocks, digestWorkers, false)
+		fileSize := getSize()
 
-		if path == "-" {
-			var done chan int64
-			blocks, done = readBlocksFromStream(os.Stdin, digestBS)
-			results := hashBlocks(blocks, digestWorkers, false)
-			fileSize = <-done
-			writeDigest(toDigestBlocks(results), digestBS, path, digestOut)
-			printStats(path, fileSize, digestBS, len(results), digestWorkers, start)
-		} else {
-			blocks, fileSize = readBlocksFromFile(path, digestBS, digestWorkers)
-			results := hashBlocks(blocks, digestWorkers, false)
-			writeDigest(toDigestBlocks(results), digestBS, path, digestOut)
-			printStats(path, fileSize, digestBS, len(results), digestWorkers, start)
-		}
+		writeDigest(toDigestBlocks(results), digestBS, path, digestOut)
+		printStats(path, fileSize, digestBS, len(results), digestWorkers, start)
 	},
 }
 
@@ -360,33 +357,18 @@ var diffCmd = &cobra.Command{
 
 		start := time.Now()
 
-		// Read blocks → hash (retaining data for patch) → find changed → write patch
-		var blocks chan block
-		var fileSize int64
+		blocks, getSize := readBlocks(path, diffBS, diffWorkers)
+		results := hashBlocks(blocks, diffWorkers, true)
+		fileSize := getSize()
 
-		if path == "-" {
-			var done chan int64
-			blocks, done = readBlocksFromStream(os.Stdin, diffBS)
-			results := hashBlocks(blocks, diffWorkers, true)
-			fileSize = <-done
-			changed := findChangedBlocks(results, oldDigest)
-			writePatchBlocks(changed, pw)
-			pw.finalize(len(changed))
-			writeDigest(toDigestBlocks(results), diffBS, path, diffOut)
-			printStats(path, fileSize, diffBS, len(results), diffWorkers, start)
-			fmt.Fprintf(os.Stderr, "changed blocks: %d / %d (%.1f%%)\n",
-				len(changed), len(results), float64(len(changed))/float64(len(results))*100)
-		} else {
-			blocks, fileSize = readBlocksFromFile(path, diffBS, diffWorkers)
-			results := hashBlocks(blocks, diffWorkers, true)
-			changed := findChangedBlocks(results, oldDigest)
-			writePatchBlocks(changed, pw)
-			pw.finalize(len(changed))
-			writeDigest(toDigestBlocks(results), diffBS, path, diffOut)
-			printStats(path, fileSize, diffBS, len(results), diffWorkers, start)
-			fmt.Fprintf(os.Stderr, "changed blocks: %d / %d (%.1f%%)\n",
-				len(changed), len(results), float64(len(changed))/float64(len(results))*100)
-		}
+		changed := findChangedBlocks(results, oldDigest)
+		writePatchBlocks(changed, pw)
+		pw.finalize(len(changed))
+
+		writeDigest(toDigestBlocks(results), diffBS, path, diffOut)
+		printStats(path, fileSize, diffBS, len(results), diffWorkers, start)
+		fmt.Fprintf(os.Stderr, "changed blocks: %d / %d (%.1f%%)\n",
+			len(changed), len(results), float64(len(changed))/float64(len(results))*100)
 	},
 }
 
