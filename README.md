@@ -92,23 +92,30 @@ Measured on a 10 GB random file (16-core machine):
 
 ## Digest format
 
-Plain text, one line per block:
+JSON:
 
-```
-# bddiff md5 bs=1048576 file=/dev/sda
-0	cff2e61d033889d72fd59cf7771b72e1
-1048576	4f4a18941dc0baf6fdba83258582e52d
-2097152	7f43ad3caf1372eba65bc03e8fdf98f6
-...
+```json
+{
+  "version": 1,
+  "algorithm": "md5",
+  "blockSize": 1048576,
+  "file": "/dev/sda",
+  "blocks": [
+    {"offset": 0, "hash": "cff2e61d033889d72fd59cf7771b72e1"},
+    {"offset": 1048576, "hash": "4f4a18941dc0baf6fdba83258582e52d"}
+  ]
+}
 ```
 
 ## Patch format
 
-Binary format:
+Binary with JSON header:
 
 ```
-"BDPATCH1"    (8 bytes magic)
-block_size    (uint64 LE)
+"BDPATCH2"    (8 bytes magic)
+header_size   (uint32 LE)
+header        (256 bytes, zero-padded JSON)
+              {"version":1,"blockSize":1048576,"count":1024}
 [entries]:
   offset      (uint64 LE)
   size        (uint32 LE)

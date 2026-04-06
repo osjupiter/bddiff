@@ -1,24 +1,47 @@
 package main
 
 import (
-	"bufio"
 	"crypto/md5"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"runtime"
 	"sort"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
 )
 
-const patchMagic = "BDPATCH1"
+const patchMagic = "BDPATCH2"
+
+// --- digest format (JSON) ---
+
+type DigestFile struct {
+	Version   int           `json:"version"`
+	Algorithm string        `json:"algorithm"`
+	BlockSize int64         `json:"blockSize"`
+	File      string        `json:"file"`
+	Blocks    []DigestBlock `json:"blocks"`
+}
+
+type DigestBlock struct {
+	Offset int64  `json:"offset"`
+	Hash   string `json:"hash"`
+}
+
+// --- patch header (JSON in binary envelope) ---
+
+type PatchHeader struct {
+	Version   int   `json:"version"`
+	BlockSize int64 `json:"blockSize"`
+	Count     int   `json:"count"`
+}
+
+// --- internal types ---
 
 type BlockResult struct {
 	Index  int64
@@ -118,13 +141,14 @@ func runDiff(cmd *cobra.Command, args []string) {
 		diffBS = oldBS
 	}
 
+	// Create patch file, write magic, reserve space for header
 	patchFile, err := os.Create(diffPatch)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error creating patch file: %v\n", err)
 		os.Exit(1)
 	}
 	defer patchFile.Close()
-	writePatchHeader(patchFile, diffBS)
+	pw := newPatchWriter(patchFile, diffBS)
 
 	start := time.Now()
 
@@ -133,10 +157,13 @@ func runDiff(cmd *cobra.Command, args []string) {
 	var changedCount int
 
 	if isStdin {
-		results, fileSize, changedCount = processStdin(os.Stdin, diffBS, diffWorkers, oldDigest, patchFile)
+		results, fileSize, changedCount = processStdin(os.Stdin, diffBS, diffWorkers, oldDigest, pw)
 	} else {
-		results, fileSize, changedCount = processFile(path, diffBS, diffWorkers, oldDigest, patchFile)
+		results, fileSize, changedCount = processFile(path, diffBS, diffWorkers, oldDigest, pw)
 	}
+
+	// Finalize patch header with actual count
+	pw.finalize(changedCount)
 
 	writeDigest(results, diffBS, path, diffOut)
 
@@ -172,15 +199,33 @@ func runApply(cmd *cobra.Command, args []string) {
 	}
 	defer pf.Close()
 
+	// Read and verify magic
 	magic := make([]byte, len(patchMagic))
 	if _, err := io.ReadFull(pf, magic); err != nil || string(magic) != patchMagic {
-		fmt.Fprintf(os.Stderr, "error: not a valid patch file\n")
+		fmt.Fprintf(os.Stderr, "error: not a valid patch file (bad magic)\n")
 		os.Exit(1)
 	}
 
-	var blockSize uint64
-	binary.Read(pf, binary.LittleEndian, &blockSize)
+	// Read header size and JSON header
+	var headerSize uint32
+	binary.Read(pf, binary.LittleEndian, &headerSize)
 
+	// Read the full 256-byte padded header area, then parse only headerSize bytes
+	paddedBuf := make([]byte, 256)
+	if _, err := io.ReadFull(pf, paddedBuf); err != nil {
+		fmt.Fprintf(os.Stderr, "error reading patch header: %v\n", err)
+		os.Exit(1)
+	}
+
+	var header PatchHeader
+	if err := json.Unmarshal(paddedBuf[:headerSize], &header); err != nil {
+		fmt.Fprintf(os.Stderr, "error parsing patch header: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Fprintf(os.Stderr, "patch: version=%d, blockSize=%d, blocks=%d\n", header.Version, header.BlockSize, header.Count)
+
+	// Open target
 	tf, err := os.OpenFile(targetPath, os.O_WRONLY, 0)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error opening target: %v\n", err)
@@ -212,10 +257,13 @@ func runApply(cmd *cobra.Command, args []string) {
 		totalBytes += uint64(size)
 	}
 
+	if applied != header.Count {
+		fmt.Fprintf(os.Stderr, "warning: expected %d blocks but applied %d\n", header.Count, applied)
+	}
 	fmt.Fprintf(os.Stderr, "applied %d blocks (%.1f MB) to %s\n", applied, float64(totalBytes)/1024/1024, targetPath)
 }
 
-// --- core logic ---
+// --- digest I/O ---
 
 func loadDigest(path string) (int64, map[int64]string, error) {
 	f, err := os.Open(path)
@@ -224,33 +272,103 @@ func loadDigest(path string) (int64, map[int64]string, error) {
 	}
 	defer f.Close()
 
-	var blockSize int64
-	digests := make(map[int64]string)
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "#") {
-			for _, part := range strings.Fields(line) {
-				if strings.HasPrefix(part, "bs=") {
-					blockSize, _ = strconv.ParseInt(part[3:], 10, 64)
-				}
-			}
-			continue
-		}
-		parts := strings.SplitN(line, "\t", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		offset, err := strconv.ParseInt(parts[0], 10, 64)
-		if err != nil {
-			continue
-		}
-		digests[offset] = parts[1]
+	var df DigestFile
+	if err := json.NewDecoder(f).Decode(&df); err != nil {
+		return 0, nil, fmt.Errorf("invalid digest JSON: %w", err)
 	}
-	return blockSize, digests, scanner.Err()
+
+	digests := make(map[int64]string, len(df.Blocks))
+	for _, b := range df.Blocks {
+		digests[b.Offset] = b.Hash
+	}
+	return df.BlockSize, digests, nil
 }
 
-func processFile(path string, blockSize int64, workers int, oldDigest map[int64]string, patchFile *os.File) ([]BlockResult, int64, int) {
+func writeDigest(results []BlockResult, blockSize int64, path string, outFile string) {
+	df := DigestFile{
+		Version:   1,
+		Algorithm: "md5",
+		BlockSize: blockSize,
+		File:      path,
+		Blocks:    make([]DigestBlock, len(results)),
+	}
+	for i, r := range results {
+		df.Blocks[i] = DigestBlock{Offset: r.Offset, Hash: r.Hash}
+	}
+
+	var out io.Writer = os.Stdout
+	if outFile != "" {
+		f, err := os.Create(outFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error creating output file: %v\n", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		out = f
+	}
+
+	enc := json.NewEncoder(out)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(df); err != nil {
+		fmt.Fprintf(os.Stderr, "error writing digest: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// --- patch I/O ---
+
+// patchWriter handles the two-phase patch writing:
+// 1. Write magic + placeholder header size + empty header space
+// 2. Write entries as they come
+// 3. finalize() seeks back and writes the real header with count
+type patchWriter struct {
+	f         *os.File
+	blockSize int64
+	headerPos int64 // position where header_size starts
+}
+
+func newPatchWriter(f *os.File, blockSize int64) *patchWriter {
+	// Write magic
+	f.Write([]byte(patchMagic))
+
+	// Remember position, write placeholder header (size=0, empty)
+	headerPos, _ := f.Seek(0, io.SeekCurrent)
+
+	// Reserve: uint32 header_size + max header JSON space (256 bytes is plenty)
+	placeholder := make([]byte, 4+256)
+	f.Write(placeholder)
+
+	return &patchWriter{f: f, blockSize: blockSize, headerPos: headerPos}
+}
+
+func (pw *patchWriter) writeEntry(offset int64, data []byte) {
+	binary.Write(pw.f, binary.LittleEndian, uint64(offset))
+	binary.Write(pw.f, binary.LittleEndian, uint32(len(data)))
+	pw.f.Write(data)
+}
+
+func (pw *patchWriter) finalize(count int) {
+	header := PatchHeader{
+		Version:   1,
+		BlockSize: pw.blockSize,
+		Count:     count,
+	}
+	headerJSON, _ := json.Marshal(header)
+	headerSize := uint32(len(headerJSON))
+
+	// Pad to 256 bytes so we don't shift entry data
+	padded := make([]byte, 256)
+	copy(padded, headerJSON)
+
+	// Seek back and write real header
+	pw.f.Seek(pw.headerPos, io.SeekStart)
+	binary.Write(pw.f, binary.LittleEndian, headerSize)
+	pw.f.Write(padded)
+}
+
+// --- core logic ---
+
+func processFile(path string, blockSize int64, workers int, oldDigest map[int64]string, pw *patchWriter) ([]BlockResult, int64, int) {
 	fi, err := os.Stat(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -305,7 +423,7 @@ func processFile(path string, blockSize int64, workers int, oldDigest map[int64]
 	})
 
 	changedCount := 0
-	if oldDigest != nil && patchFile != nil {
+	if oldDigest != nil && pw != nil {
 		var changed []BlockResult
 		for _, r := range results {
 			if oldHash, ok := oldDigest[r.Offset]; !ok || oldHash != r.Hash {
@@ -327,14 +445,14 @@ func processFile(path string, blockSize int64, workers int, oldDigest map[int64]
 				size = fileSize - r.Offset
 			}
 			n, _ := f.ReadAt(buf[:size], r.Offset)
-			writePatchEntry(patchFile, r.Offset, buf[:n])
+			pw.writeEntry(r.Offset, buf[:n])
 		}
 	}
 
 	return results, fileSize, changedCount
 }
 
-func processStdin(r io.Reader, blockSize int64, workers int, oldDigest map[int64]string, patchFile *os.File) ([]BlockResult, int64, int) {
+func processStdin(r io.Reader, blockSize int64, workers int, oldDigest map[int64]string, pw *patchWriter) ([]BlockResult, int64, int) {
 	type hashJob struct {
 		index  int64
 		offset int64
@@ -366,7 +484,7 @@ func processStdin(r io.Reader, blockSize int64, workers int, oldDigest map[int64
 					BlockResult: BlockResult{Index: j.index, Offset: j.offset, Hash: hash},
 					changed:     changed,
 				}
-				if changed && patchFile != nil {
+				if changed && pw != nil {
 					res.data = j.data
 				}
 				resultsCh <- res
@@ -412,43 +530,13 @@ func processStdin(r io.Reader, blockSize int64, workers int, oldDigest map[int64
 		results[i] = c.BlockResult
 		if c.changed {
 			changedCount++
-			if patchFile != nil && c.data != nil {
-				writePatchEntry(patchFile, c.Offset, c.data)
+			if pw != nil && c.data != nil {
+				pw.writeEntry(c.Offset, c.data)
 			}
 		}
 	}
 
 	return results, fileSize, changedCount
-}
-
-func writeDigest(results []BlockResult, blockSize int64, path string, outFile string) {
-	var out io.Writer = os.Stdout
-	if outFile != "" {
-		f, err := os.Create(outFile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error creating output file: %v\n", err)
-			os.Exit(1)
-		}
-		defer f.Close()
-		out = f
-	}
-	w := bufio.NewWriter(out)
-	fmt.Fprintf(w, "# bddiff md5 bs=%d file=%s\n", blockSize, path)
-	for _, r := range results {
-		fmt.Fprintf(w, "%d\t%s\n", r.Offset, r.Hash)
-	}
-	w.Flush()
-}
-
-func writePatchHeader(w io.Writer, blockSize int64) {
-	w.Write([]byte(patchMagic))
-	binary.Write(w, binary.LittleEndian, uint64(blockSize))
-}
-
-func writePatchEntry(w io.Writer, offset int64, data []byte) {
-	binary.Write(w, binary.LittleEndian, uint64(offset))
-	binary.Write(w, binary.LittleEndian, uint32(len(data)))
-	w.Write(data)
 }
 
 func main() {
