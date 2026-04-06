@@ -39,44 +39,38 @@ type PatchHeader struct {
 	Count     int   `json:"count"`
 }
 
-type BlockResult struct {
-	Index  int64
-	Offset int64
-	Hash   string
+type block struct {
+	index  int64
+	offset int64
+	data   []byte
 }
 
-// --- block reader abstraction ---
-
-// blockReader yields (index, offset, data) for each block in the source.
-// file mode: each worker opens its own fd and uses ReadAt (parallel I/O).
-// stdin mode: main goroutine reads sequentially, dispatches to workers.
-type blockReader struct {
-	blockSize int64
-	workers   int
+type hashResult struct {
+	index  int64
+	offset int64
+	hash   string
+	data   []byte // retained only when diff mode needs it
 }
 
-func (br *blockReader) hashAll(path string, r io.Reader) ([]BlockResult, int64) {
-	if r != nil {
-		return br.hashStream(r)
-	}
-	return br.hashFile(path)
-}
+// --- block reading: produces chan block ---
 
-func (br *blockReader) hashFile(path string) ([]BlockResult, int64) {
+// readBlocksFromFile reads blocks using parallel ReadAt and sends them to a channel.
+func readBlocksFromFile(path string, blockSize int64, workers int) (chan block, int64) {
 	fi, err := os.Stat(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 	fileSize := fi.Size()
-	totalBlocks := (fileSize + br.blockSize - 1) / br.blockSize
+	totalBlocks := (fileSize + blockSize - 1) / blockSize
+	ch := make(chan block, workers*2)
 
+	// Dispatch index-only jobs to reader workers, who ReadAt and send blocks
 	type job struct{ index, offset, size int64 }
-	jobs := make(chan job, br.workers*2)
-	results := make([]BlockResult, totalBlocks)
-	var wg sync.WaitGroup
+	jobs := make(chan job, workers*2)
 
-	for w := 0; w < br.workers; w++ {
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -86,207 +80,124 @@ func (br *blockReader) hashFile(path string) ([]BlockResult, int64) {
 				return
 			}
 			defer f.Close()
-			buf := make([]byte, br.blockSize)
 			for j := range jobs {
-				n, _ := f.ReadAt(buf[:j.size], j.offset)
-				h := md5.Sum(buf[:n])
-				results[j.index] = BlockResult{
-					Index:  j.index,
-					Offset: j.offset,
-					Hash:   hex.EncodeToString(h[:]),
-				}
+				buf := make([]byte, j.size)
+				n, _ := f.ReadAt(buf, j.offset)
+				ch <- block{index: j.index, offset: j.offset, data: buf[:n]}
 			}
 		}()
 	}
 
-	for i := int64(0); i < totalBlocks; i++ {
-		offset := i * br.blockSize
-		size := br.blockSize
-		if offset+size > fileSize {
-			size = fileSize - offset
+	go func() {
+		for i := int64(0); i < totalBlocks; i++ {
+			offset := i * blockSize
+			size := blockSize
+			if offset+size > fileSize {
+				size = fileSize - offset
+			}
+			jobs <- job{i, offset, size}
 		}
-		jobs <- job{i, offset, size}
-	}
-	close(jobs)
-	wg.Wait()
+		close(jobs)
+		wg.Wait()
+		close(ch)
+	}()
 
-	sort.Slice(results, func(i, j int) bool { return results[i].Index < results[j].Index })
-	return results, fileSize
+	return ch, fileSize
 }
 
-func (br *blockReader) hashStream(r io.Reader) ([]BlockResult, int64) {
-	type hashJob struct {
-		index  int64
-		offset int64
-		data   []byte
-	}
+// readBlocksFromStream reads blocks sequentially from an io.Reader.
+func readBlocksFromStream(r io.Reader, blockSize int64) (chan block, chan int64) {
+	ch := make(chan block, 16)
+	done := make(chan int64, 1)
 
-	jobsCh := make(chan hashJob, br.workers)
-	resultsCh := make(chan BlockResult, br.workers)
+	go func() {
+		var fileSize int64
+		for index := int64(0); ; index++ {
+			buf := make([]byte, blockSize)
+			n, err := io.ReadFull(r, buf)
+			if n == 0 {
+				break
+			}
+			fileSize += int64(n)
+			ch <- block{index: index, offset: index * blockSize, data: buf[:n]}
+			if err != nil {
+				break
+			}
+		}
+		close(ch)
+		done <- fileSize
+	}()
+
+	return ch, done
+}
+
+// --- hash pipeline: consumes chan block, produces []hashResult ---
+
+func hashBlocks(blocks chan block, workers int, retainData bool) []hashResult {
+	resultsCh := make(chan hashResult, workers)
 
 	var wg sync.WaitGroup
-	for w := 0; w < br.workers; w++ {
+	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := range jobsCh {
-				h := md5.Sum(j.data)
-				resultsCh <- BlockResult{
-					Index:  j.index,
-					Offset: j.offset,
-					Hash:   hex.EncodeToString(h[:]),
+			for b := range blocks {
+				h := md5.Sum(b.data)
+				r := hashResult{
+					index:  b.index,
+					offset: b.offset,
+					hash:   hex.EncodeToString(h[:]),
 				}
+				if retainData {
+					r.data = b.data
+				}
+				resultsCh <- r
 			}
 		}()
 	}
 
-	var collected []BlockResult
+	var results []hashResult
 	var collectorWg sync.WaitGroup
 	collectorWg.Add(1)
 	go func() {
 		defer collectorWg.Done()
 		for r := range resultsCh {
-			collected = append(collected, r)
+			results = append(results, r)
 		}
 	}()
 
-	var fileSize int64
-	for index := int64(0); ; index++ {
-		buf := make([]byte, br.blockSize)
-		n, err := io.ReadFull(r, buf)
-		if n == 0 {
-			break
-		}
-		fileSize += int64(n)
-		jobsCh <- hashJob{index: index, offset: index * br.blockSize, data: buf[:n]}
-		if err != nil {
-			break
-		}
-	}
-	close(jobsCh)
 	wg.Wait()
 	close(resultsCh)
 	collectorWg.Wait()
 
-	sort.Slice(collected, func(i, j int) bool { return collected[i].Index < collected[j].Index })
-	return collected, fileSize
+	sort.Slice(results, func(i, j int) bool { return results[i].index < results[j].index })
+	return results
+}
+
+func toDigestBlocks(hrs []hashResult) []DigestBlock {
+	out := make([]DigestBlock, len(hrs))
+	for i, r := range hrs {
+		out[i] = DigestBlock{Offset: r.offset, Hash: r.hash}
+	}
+	return out
 }
 
 // --- diff logic ---
 
-func findChangedBlocks(results []BlockResult, oldDigest map[int64]string) []BlockResult {
-	var changed []BlockResult
+func findChangedBlocks(results []hashResult, oldDigest map[int64]string) []hashResult {
+	var changed []hashResult
 	for _, r := range results {
-		if oldHash, ok := oldDigest[r.Offset]; !ok || oldHash != r.Hash {
+		if oldHash, ok := oldDigest[r.offset]; !ok || oldHash != r.hash {
 			changed = append(changed, r)
 		}
 	}
 	return changed
 }
 
-func writeChangedBlocksFromFile(path string, blockSize int64, fileSize int64, changed []BlockResult, pw *patchWriter) {
-	f, err := os.Open(path)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error opening file for patch: %v\n", err)
-		os.Exit(1)
-	}
-	defer f.Close()
-	buf := make([]byte, blockSize)
+func writePatchBlocks(changed []hashResult, pw *patchWriter) {
 	for _, r := range changed {
-		size := blockSize
-		if r.Offset+size > fileSize {
-			size = fileSize - r.Offset
-		}
-		n, _ := f.ReadAt(buf[:size], r.Offset)
-		pw.writeEntry(r.Offset, buf[:n])
+		pw.writeEntry(r.offset, r.data)
 	}
-}
-
-func writeChangedBlocksFromStdin(r io.Reader, blockSize int64, workers int, changed []BlockResult, pw *patchWriter) {
-	// For stdin diff, we need a second pass — but stdin can't be re-read.
-	// Instead, the caller should use hashStreamWithDiff which captures data inline.
-	// This function exists only for the file path.
-	panic("writeChangedBlocksFromStdin should not be called; use hashStreamWithDiff")
-}
-
-// hashStreamWithDiff hashes stdin and writes changed blocks to patch in one pass.
-func (br *blockReader) hashStreamWithDiff(r io.Reader, oldDigest map[int64]string, pw *patchWriter) ([]BlockResult, int64, int) {
-	type hashJob struct {
-		index  int64
-		offset int64
-		data   []byte
-	}
-	type hashResult struct {
-		BlockResult
-		changed bool
-		data    []byte
-	}
-
-	jobsCh := make(chan hashJob, br.workers)
-	resultsCh := make(chan hashResult, br.workers)
-
-	var wg sync.WaitGroup
-	for w := 0; w < br.workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := range jobsCh {
-				h := md5.Sum(j.data)
-				hash := hex.EncodeToString(h[:])
-				oldHash, ok := oldDigest[j.offset]
-				changed := !ok || oldHash != hash
-				res := hashResult{
-					BlockResult: BlockResult{Index: j.index, Offset: j.offset, Hash: hash},
-					changed:     changed,
-				}
-				if changed {
-					res.data = j.data
-				}
-				resultsCh <- res
-			}
-		}()
-	}
-
-	var collected []hashResult
-	var collectorWg sync.WaitGroup
-	collectorWg.Add(1)
-	go func() {
-		defer collectorWg.Done()
-		for r := range resultsCh {
-			collected = append(collected, r)
-		}
-	}()
-
-	var fileSize int64
-	for index := int64(0); ; index++ {
-		buf := make([]byte, br.blockSize)
-		n, err := io.ReadFull(r, buf)
-		if n == 0 {
-			break
-		}
-		fileSize += int64(n)
-		jobsCh <- hashJob{index: index, offset: index * br.blockSize, data: buf[:n]}
-		if err != nil {
-			break
-		}
-	}
-	close(jobsCh)
-	wg.Wait()
-	close(resultsCh)
-	collectorWg.Wait()
-
-	sort.Slice(collected, func(i, j int) bool { return collected[i].Index < collected[j].Index })
-
-	changedCount := 0
-	results := make([]BlockResult, len(collected))
-	for i, c := range collected {
-		results[i] = c.BlockResult
-		if c.changed {
-			changedCount++
-			pw.writeEntry(c.Offset, c.data)
-		}
-	}
-	return results, fileSize, changedCount
 }
 
 // --- digest I/O ---
@@ -310,16 +221,13 @@ func loadDigest(path string) (int64, map[int64]string, error) {
 	return df.BlockSize, digests, nil
 }
 
-func writeDigest(results []BlockResult, blockSize int64, path string, outFile string) {
+func writeDigest(blocks []DigestBlock, blockSize int64, path string, outFile string) {
 	df := DigestFile{
 		Version:   1,
 		Algorithm: "md5",
 		BlockSize: blockSize,
 		File:      path,
-		Blocks:    make([]DigestBlock, len(results)),
-	}
-	for i, r := range results {
-		df.Blocks[i] = DigestBlock{Offset: r.Offset, Hash: r.Hash}
+		Blocks:    blocks,
 	}
 
 	var out io.Writer = os.Stdout
@@ -394,19 +302,24 @@ var digestCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		path := args[0]
-		br := &blockReader{blockSize: digestBS, workers: digestWorkers}
 		start := time.Now()
 
-		var results []BlockResult
+		var blocks chan block
 		var fileSize int64
-		if path == "-" {
-			results, fileSize = br.hashAll("", os.Stdin)
-		} else {
-			results, fileSize = br.hashAll(path, nil)
-		}
 
-		writeDigest(results, digestBS, path, digestOut)
-		printStats(path, fileSize, digestBS, len(results), digestWorkers, start)
+		if path == "-" {
+			var done chan int64
+			blocks, done = readBlocksFromStream(os.Stdin, digestBS)
+			results := hashBlocks(blocks, digestWorkers, false)
+			fileSize = <-done
+			writeDigest(toDigestBlocks(results), digestBS, path, digestOut)
+			printStats(path, fileSize, digestBS, len(results), digestWorkers, start)
+		} else {
+			blocks, fileSize = readBlocksFromFile(path, digestBS, digestWorkers)
+			results := hashBlocks(blocks, digestWorkers, false)
+			writeDigest(toDigestBlocks(results), digestBS, path, digestOut)
+			printStats(path, fileSize, digestBS, len(results), digestWorkers, start)
+		}
 	},
 }
 
@@ -445,30 +358,35 @@ var diffCmd = &cobra.Command{
 		defer patchFile.Close()
 		pw := newPatchWriter(patchFile, diffBS)
 
-		br := &blockReader{blockSize: diffBS, workers: diffWorkers}
 		start := time.Now()
 
-		var results []BlockResult
+		// Read blocks → hash (retaining data for patch) → find changed → write patch
+		var blocks chan block
 		var fileSize int64
-		var changedCount int
 
 		if path == "-" {
-			// stdin: one-pass hash + diff + patch (can't re-read)
-			results, fileSize, changedCount = br.hashStreamWithDiff(os.Stdin, oldDigest, pw)
-		} else {
-			// file: hash all, then read only changed blocks for patch
-			results, fileSize = br.hashAll(path, nil)
+			var done chan int64
+			blocks, done = readBlocksFromStream(os.Stdin, diffBS)
+			results := hashBlocks(blocks, diffWorkers, true)
+			fileSize = <-done
 			changed := findChangedBlocks(results, oldDigest)
-			changedCount = len(changed)
-			writeChangedBlocksFromFile(path, diffBS, fileSize, changed, pw)
+			writePatchBlocks(changed, pw)
+			pw.finalize(len(changed))
+			writeDigest(toDigestBlocks(results), diffBS, path, diffOut)
+			printStats(path, fileSize, diffBS, len(results), diffWorkers, start)
+			fmt.Fprintf(os.Stderr, "changed blocks: %d / %d (%.1f%%)\n",
+				len(changed), len(results), float64(len(changed))/float64(len(results))*100)
+		} else {
+			blocks, fileSize = readBlocksFromFile(path, diffBS, diffWorkers)
+			results := hashBlocks(blocks, diffWorkers, true)
+			changed := findChangedBlocks(results, oldDigest)
+			writePatchBlocks(changed, pw)
+			pw.finalize(len(changed))
+			writeDigest(toDigestBlocks(results), diffBS, path, diffOut)
+			printStats(path, fileSize, diffBS, len(results), diffWorkers, start)
+			fmt.Fprintf(os.Stderr, "changed blocks: %d / %d (%.1f%%)\n",
+				len(changed), len(results), float64(len(changed))/float64(len(results))*100)
 		}
-
-		pw.finalize(changedCount)
-		writeDigest(results, diffBS, path, diffOut)
-
-		printStats(path, fileSize, diffBS, len(results), diffWorkers, start)
-		fmt.Fprintf(os.Stderr, "changed blocks: %d / %d (%.1f%%)\n",
-			changedCount, len(results), float64(changedCount)/float64(len(results))*100)
 	},
 }
 
