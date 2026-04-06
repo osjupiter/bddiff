@@ -1,0 +1,8 @@
+# config file for the tagpr in git config format
+# The tagpr generates the initial .tagpr file and anddings to the .git/config
+# file if there are any unconfigurated items. You can also rewrite and configure
+# this file manually. The file format is the same as the git config format.
+
+[tagpr]
+	vPrefix = true
+	releaseBranch = main
