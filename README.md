@@ -109,18 +109,19 @@ JSON:
 
 ## Patch format
 
-Binary with JSON header:
+Binary with JSON trailer (variable-length, no fixed padding):
 
 ```
-"BDPATCH2"    (8 bytes magic)
-header_size   (uint32 LE)
-header        (256 bytes, zero-padded JSON)
-              {"version":1,"blockSize":1048576,"count":1024}
+"BDPATCH3"        (8 bytes magic)
 [entries]:
-  offset      (uint64 LE)
-  size        (uint32 LE)
-  data        (size bytes)
+  offset          (uint64 LE)
+  size            (uint32 LE)
+  data            (size bytes)
+header JSON       (variable length)
+header_offset     (uint64 LE — byte position where header JSON starts)
 ```
+
+The header is written at the end of the file after all entries, so it can include the exact block count without pre-allocation or seek-back.
 
 ## License
 

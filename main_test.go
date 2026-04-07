@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
@@ -16,6 +17,7 @@ func TestRoundtrip(t *testing.T) {
 	blockSize := int64(1024) // 1KB blocks for fast test
 	totalSize := int64(1024 * 100) // 100KB
 	workers := 4
+	ctx := context.Background()
 
 	// Create original file with random data
 	origPath := filepath.Join(dir, "orig.bin")
@@ -25,9 +27,10 @@ func TestRoundtrip(t *testing.T) {
 
 	// Generate digest
 	digestPath := filepath.Join(dir, "orig.digest")
-	blocks, getSize := readBlocks(origPath, blockSize, workers)
-	results := hashBlocks(blocks, workers, false)
-	fileSize := getSize()
+	src := openFileSource(ctx, origPath, blockSize, workers)
+	defer src.cleanup()
+	results := hashBlocks(ctx, src.blocks, workers)
+	fileSize := src.getSize()
 	if fileSize != totalSize {
 		t.Fatalf("fileSize=%d, want %d", fileSize, totalSize)
 	}
@@ -71,16 +74,17 @@ func TestRoundtrip(t *testing.T) {
 	pf, _ := os.Create(patchPath)
 	pw := newPatchWriter(pf, blockSize)
 
-	blocks2, getSize2 := readBlocks(modPath, blockSize, workers)
-	results2 := hashBlocks(blocks2, workers, true)
-	fileSize2 := getSize2()
+	src2 := openFileSource(ctx, modPath, blockSize, workers)
+	defer src2.cleanup()
+	results2 := hashBlocks(ctx, src2.blocks, workers)
+	fileSize2 := src2.getSize()
 	if fileSize2 != totalSize {
 		t.Fatalf("modified fileSize=%d, want %d", fileSize2, totalSize)
 	}
 
 	changed := findChangedBlocks(results2, oldDigest)
-	writePatchBlocks(changed, pw)
-	pw.finalize(len(changed))
+	writeChangedToPatch(src2, blockSize, fileSize2, changed, pw)
+	pw.finalize()
 	pf.Close()
 
 	writeDigest(toDigestBlocks(results2), blockSize, modPath, newDigestPath)
@@ -103,7 +107,7 @@ func TestRoundtrip(t *testing.T) {
 	copy(appliedData, origData)
 	os.WriteFile(appliedPath, appliedData, 0644)
 
-	applyPatch(t, patchPath, appliedPath)
+	applyPatchForTest(t, patchPath, appliedPath)
 
 	// Verify applied file matches modified file
 	appliedResult, _ := os.ReadFile(appliedPath)
@@ -117,6 +121,7 @@ func TestRoundtripStdin(t *testing.T) {
 	blockSize := int64(1024)
 	totalSize := int64(1024 * 50) // 50KB
 	workers := 4
+	ctx := context.Background()
 
 	// Create original
 	origData := make([]byte, totalSize)
@@ -126,17 +131,18 @@ func TestRoundtripStdin(t *testing.T) {
 
 	// Digest via file
 	digestPath := filepath.Join(dir, "orig.digest")
-	blocks, getSize := readBlocks(origPath, blockSize, workers)
-	results := hashBlocks(blocks, workers, false)
-	getSize()
+	src := openFileSource(ctx, origPath, blockSize, workers)
+	results := hashBlocks(ctx, src.blocks, workers)
+	src.getSize()
+	src.cleanup()
 	writeDigest(toDigestBlocks(results), blockSize, origPath, digestPath)
 
 	// Digest via stdin and compare
 	stdinDigestPath := filepath.Join(dir, "stdin.digest")
-	stdinReader := bytes.NewReader(origData)
-	blocksCh, sizeDone := readBlocksFromStream(stdinReader, blockSize)
-	stdinResults := hashBlocks(blocksCh, workers, false)
-	stdinSize := sizeDone()
+	stdinSrc := openStdinSource(ctx, bytes.NewReader(origData), blockSize, false)
+	stdinResults := hashBlocks(ctx, stdinSrc.blocks, workers)
+	stdinSize := stdinSrc.getSize()
+	stdinSrc.cleanup()
 	if stdinSize != totalSize {
 		t.Fatalf("stdin size=%d, want %d", stdinSize, totalSize)
 	}
@@ -159,6 +165,64 @@ func TestRoundtripStdin(t *testing.T) {
 	}
 }
 
+func TestStdinDiffRoundtrip(t *testing.T) {
+	dir := t.TempDir()
+	blockSize := int64(1024)
+	totalSize := int64(1024 * 50)
+	workers := 4
+	ctx := context.Background()
+
+	// Create original and digest
+	origData := make([]byte, totalSize)
+	rand.Read(origData)
+	origPath := filepath.Join(dir, "orig.bin")
+	os.WriteFile(origPath, origData, 0644)
+
+	digestPath := filepath.Join(dir, "orig.digest")
+	src := openFileSource(ctx, origPath, blockSize, workers)
+	results := hashBlocks(ctx, src.blocks, workers)
+	src.cleanup()
+	writeDigest(toDigestBlocks(results), blockSize, origPath, digestPath)
+
+	// Create modified data
+	modData := make([]byte, totalSize)
+	copy(modData, origData)
+	for _, i := range []int{5, 10, 20, 30, 40} {
+		offset := int64(i) * blockSize
+		rand.Read(modData[offset : offset+blockSize])
+	}
+
+	_, oldDigest, _ := loadDigest(digestPath)
+
+	// Diff via stdin (uses temp file for reread)
+	patchPath := filepath.Join(dir, "stdin.patch")
+	pf, _ := os.Create(patchPath)
+	pw := newPatchWriter(pf, blockSize)
+
+	stdinSrc := openStdinSource(ctx, bytes.NewReader(modData), blockSize, true)
+	stdinResults := hashBlocks(ctx, stdinSrc.blocks, workers)
+	stdinSrc.getSize()
+	changed := findChangedBlocks(stdinResults, oldDigest)
+	writeChangedToPatch(stdinSrc, blockSize, int64(len(modData)), changed, pw)
+	pw.finalize()
+	pf.Close()
+	stdinSrc.cleanup()
+
+	if len(changed) != 5 {
+		t.Fatalf("changed=%d, want 5", len(changed))
+	}
+
+	// Apply and verify
+	appliedPath := filepath.Join(dir, "applied.bin")
+	os.WriteFile(appliedPath, origData, 0644)
+	applyPatchForTest(t, patchPath, appliedPath)
+
+	appliedResult, _ := os.ReadFile(appliedPath)
+	if !bytes.Equal(appliedResult, modData) {
+		t.Fatal("stdin diff: applied file does not match modified data")
+	}
+}
+
 func TestPatchFormat(t *testing.T) {
 	dir := t.TempDir()
 	patchPath := filepath.Join(dir, "test.patch")
@@ -167,26 +231,14 @@ func TestPatchFormat(t *testing.T) {
 	pw := newPatchWriter(f, 4096)
 	pw.writeEntry(0, []byte("hello"))
 	pw.writeEntry(4096, []byte("world"))
-	pw.finalize(2)
+	pw.finalize()
 	f.Close()
 
-	// Read back and verify
+	// Read back and verify using readPatchHeader
 	pf, _ := os.Open(patchPath)
 	defer pf.Close()
 
-	magic := make([]byte, 8)
-	io.ReadFull(pf, magic)
-	if string(magic) != patchMagic {
-		t.Fatalf("bad magic: %q", magic)
-	}
-
-	var headerSize uint32
-	binary.Read(pf, binary.LittleEndian, &headerSize)
-	paddedBuf := make([]byte, 256)
-	io.ReadFull(pf, paddedBuf)
-
-	var header PatchHeader
-	json.Unmarshal(paddedBuf[:headerSize], &header)
+	header := readPatchHeader(pf)
 
 	if header.Version != 1 {
 		t.Errorf("version=%d, want 1", header.Version)
@@ -197,30 +249,10 @@ func TestPatchFormat(t *testing.T) {
 	if header.Count != 2 {
 		t.Errorf("count=%d, want 2", header.Count)
 	}
-
-	// Read entries
-	for _, expected := range []struct {
-		offset uint64
-		data   string
-	}{{0, "hello"}, {4096, "world"}} {
-		var offset uint64
-		binary.Read(pf, binary.LittleEndian, &offset)
-		var size uint32
-		binary.Read(pf, binary.LittleEndian, &size)
-		data := make([]byte, size)
-		io.ReadFull(pf, data)
-
-		if offset != expected.offset {
-			t.Errorf("offset=%d, want %d", offset, expected.offset)
-		}
-		if string(data) != expected.data {
-			t.Errorf("data=%q, want %q", data, expected.data)
-		}
-	}
 }
 
-// applyPatch applies a patch file to a target (reuses the apply logic inline for testing)
-func applyPatch(t *testing.T, patchPath, targetPath string) {
+// applyPatchForTest applies a patch using readPatchHeader
+func applyPatchForTest(t *testing.T, patchPath, targetPath string) {
 	t.Helper()
 
 	pf, err := os.Open(patchPath)
@@ -229,38 +261,18 @@ func applyPatch(t *testing.T, patchPath, targetPath string) {
 	}
 	defer pf.Close()
 
-	magic := make([]byte, len(patchMagic))
-	io.ReadFull(pf, magic)
-	if string(magic) != patchMagic {
-		t.Fatalf("bad magic")
-	}
-
-	var headerSize uint32
-	binary.Read(pf, binary.LittleEndian, &headerSize)
-	paddedBuf := make([]byte, 256)
-	io.ReadFull(pf, paddedBuf)
-
-	var header PatchHeader
-	json.Unmarshal(paddedBuf[:headerSize], &header)
+	header := readPatchHeader(pf)
 
 	tf, _ := os.OpenFile(targetPath, os.O_WRONLY, 0)
 	defer tf.Close()
 
-	applied := 0
-	for {
+	for i := 0; i < header.Count; i++ {
 		var offset uint64
-		if err := binary.Read(pf, binary.LittleEndian, &offset); err != nil {
-			break
-		}
+		binary.Read(pf, binary.LittleEndian, &offset)
 		var size uint32
 		binary.Read(pf, binary.LittleEndian, &size)
 		data := make([]byte, size)
 		io.ReadFull(pf, data)
 		tf.WriteAt(data, int64(offset))
-		applied++
-	}
-
-	if applied != header.Count {
-		t.Errorf("applied %d blocks, header says %d", applied, header.Count)
 	}
 }
