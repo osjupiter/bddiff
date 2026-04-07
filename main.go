@@ -53,26 +53,16 @@ type hashResult struct {
 	hash   string
 }
 
-// --- block source ---
+// --- block reading ---
 
-// blockSource abstracts reading blocks from a file or stdin.
-// rereadBlock allows re-reading a block's data after hashing (for patch writing).
-// For file mode, it reads from the original file. For stdin, from a temp file.
-type blockSource struct {
-	blocks      chan block
-	getSize     func() int64
-	rereadBlock func(offset int64, size int64) ([]byte, error)
-	cleanup     func()
-}
-
-func openBlockSource(ctx context.Context, path string, blockSize int64, workers int, needReread bool) *blockSource {
+func readBlocks(ctx context.Context, path string, blockSize int64, workers int) (chan block, func() int64) {
 	if path == "-" {
-		return openStdinSource(ctx, os.Stdin, blockSize, needReread)
+		return readBlocksFromStream(ctx, os.Stdin, blockSize)
 	}
-	return openFileSource(ctx, path, blockSize, workers)
+	return readBlocksFromFile(ctx, path, blockSize, workers)
 }
 
-func openFileSource(ctx context.Context, path string, blockSize int64, workers int) *blockSource {
+func readBlocksFromFile(ctx context.Context, path string, blockSize int64, workers int) (chan block, func() int64) {
 	fi, err := os.Stat(path)
 	if err != nil {
 		fatal("error: %v", err)
@@ -127,38 +117,12 @@ func openFileSource(ctx context.Context, path string, blockSize int64, workers i
 		close(ch)
 	}()
 
-	return &blockSource{
-		blocks:  ch,
-		getSize: func() int64 { return fileSize },
-		rereadBlock: func(offset int64, size int64) ([]byte, error) {
-			f, err := os.Open(path)
-			if err != nil {
-				return nil, err
-			}
-			defer f.Close()
-			buf := make([]byte, size)
-			n, err := f.ReadAt(buf, offset)
-			if err != nil && err != io.EOF {
-				return nil, err
-			}
-			return buf[:n], nil
-		},
-		cleanup: func() {},
-	}
+	return ch, func() int64 { return fileSize }
 }
 
-func openStdinSource(ctx context.Context, r io.Reader, blockSize int64, needReread bool) *blockSource {
+func readBlocksFromStream(ctx context.Context, r io.Reader, blockSize int64) (chan block, func() int64) {
 	ch := make(chan block, 16)
 	done := make(chan int64, 1)
-
-	var tmpFile *os.File
-	if needReread {
-		var err error
-		tmpFile, err = os.CreateTemp("", "bddiff-stdin-*")
-		if err != nil {
-			fatal("error creating temp file: %v", err)
-		}
-	}
 
 	go func() {
 		var fileSize int64
@@ -176,11 +140,6 @@ func openStdinSource(ctx context.Context, r io.Reader, blockSize int64, needRere
 				break
 			}
 			fileSize += int64(n)
-			if tmpFile != nil {
-				if _, werr := tmpFile.WriteAt(buf[:n], index*blockSize); werr != nil {
-					fatal("error writing temp file: %v", werr)
-				}
-			}
 			ch <- block{index: index, offset: index * blockSize, data: buf[:n]}
 			if err != nil {
 				break
@@ -192,37 +151,56 @@ func openStdinSource(ctx context.Context, r io.Reader, blockSize int64, needRere
 
 	var sizeOnce sync.Once
 	var fileSize int64
-
-	return &blockSource{
-		blocks: ch,
-		getSize: func() int64 {
-			sizeOnce.Do(func() { fileSize = <-done })
-			return fileSize
-		},
-		rereadBlock: func(offset int64, size int64) ([]byte, error) {
-			if tmpFile == nil {
-				return nil, fmt.Errorf("stdin source opened without reread support")
-			}
-			buf := make([]byte, size)
-			n, err := tmpFile.ReadAt(buf, offset)
-			if err != nil && err != io.EOF {
-				return nil, err
-			}
-			return buf[:n], nil
-		},
-		cleanup: func() {
-			if tmpFile != nil {
-				name := tmpFile.Name()
-				tmpFile.Close()
-				os.Remove(name)
-			}
-		},
+	return ch, func() int64 {
+		sizeOnce.Do(func() { fileSize = <-done })
+		return fileSize
 	}
 }
 
-// --- hash pipeline ---
+// --- hash + diff pipeline ---
 
-func hashBlocks(ctx context.Context, blocks chan block, workers int) []hashResult {
+type patchEntry struct {
+	offset int64
+	data   []byte
+}
+
+// diffOpts enables inline diff during hashing. When set, workers compare
+// the block hash against oldDigest and send changed blocks to patchCh.
+// A separate goroutine drains patchCh and writes to the patchWriter.
+type diffOpts struct {
+	oldDigest map[int64]string
+	pw        *patchWriter
+	patchCh   chan patchEntry
+	patchDone sync.WaitGroup
+	changed   int
+}
+
+func newDiffOpts(oldDigest map[int64]string, pw *patchWriter, bufSize int) *diffOpts {
+	opts := &diffOpts{
+		oldDigest: oldDigest,
+		pw:        pw,
+		patchCh:   make(chan patchEntry, bufSize),
+	}
+	opts.patchDone.Add(1)
+	go func() {
+		defer opts.patchDone.Done()
+		for e := range opts.patchCh {
+			pw.writeEntry(e.offset, e.data)
+			opts.changed++
+		}
+	}()
+	return opts
+}
+
+func (opts *diffOpts) close() {
+	close(opts.patchCh)
+	opts.patchDone.Wait()
+}
+
+// processBlocks hashes blocks from the channel.
+// If opts is non-nil, workers also compare hashes and send changed blocks
+// to a separate patch-writing goroutine via channel.
+func processBlocks(ctx context.Context, blocks chan block, workers int, opts *diffOpts) []hashResult {
 	resultsCh := make(chan hashResult, workers)
 
 	var wg sync.WaitGroup
@@ -232,10 +210,19 @@ func hashBlocks(ctx context.Context, blocks chan block, workers int) []hashResul
 			defer wg.Done()
 			for b := range blocks {
 				h := md5.Sum(b.data)
+				hash := hex.EncodeToString(h[:])
+
+				if opts != nil {
+					oldHash, ok := opts.oldDigest[b.offset]
+					if !ok || oldHash != hash {
+						opts.patchCh <- patchEntry{offset: b.offset, data: b.data}
+					}
+				}
+
 				resultsCh <- hashResult{
 					index:  b.index,
 					offset: b.offset,
-					hash:   hex.EncodeToString(h[:]),
+					hash:   hash,
 				}
 			}
 		}()
@@ -255,6 +242,10 @@ func hashBlocks(ctx context.Context, blocks chan block, workers int) []hashResul
 	close(resultsCh)
 	collectorWg.Wait()
 
+	if opts != nil {
+		opts.close()
+	}
+
 	if ctx.Err() != nil {
 		fatal("cancelled")
 	}
@@ -269,32 +260,6 @@ func toDigestBlocks(hrs []hashResult) []DigestBlock {
 		out[i] = DigestBlock{Offset: r.offset, Hash: r.hash}
 	}
 	return out
-}
-
-// --- diff logic ---
-
-func findChangedBlocks(results []hashResult, oldDigest map[int64]string) []hashResult {
-	var changed []hashResult
-	for _, r := range results {
-		if oldHash, ok := oldDigest[r.offset]; !ok || oldHash != r.hash {
-			changed = append(changed, r)
-		}
-	}
-	return changed
-}
-
-func writeChangedToPatch(src *blockSource, blockSize int64, fileSize int64, changed []hashResult, pw *patchWriter) {
-	for _, r := range changed {
-		size := blockSize
-		if r.offset+size > fileSize {
-			size = fileSize - r.offset
-		}
-		data, err := src.rereadBlock(r.offset, size)
-		if err != nil {
-			fatal("error re-reading block at offset %d: %v", r.offset, err)
-		}
-		pw.writeEntry(r.offset, data)
-	}
 }
 
 // --- digest I/O ---
@@ -354,9 +319,6 @@ func writeDigest(blocks []DigestBlock, blockSize int64, path string, outFile str
 //     data              (size bytes)
 //   header JSON         (variable length)
 //   header_offset       (uint64 LE — position where header JSON starts)
-//
-// Reader: read magic, seek to EOF-8 for header_offset, seek there to read header,
-//         then read entries from byte 8 until header_offset.
 
 type patchWriter struct {
 	f         *os.File
@@ -385,18 +347,15 @@ func (pw *patchWriter) finalize() {
 }
 
 func readPatchHeader(pf *os.File) PatchHeader {
-	// Read and verify magic
 	magic := make([]byte, len(patchMagic))
 	if _, err := io.ReadFull(pf, magic); err != nil || string(magic) != patchMagic {
 		fatal("not a valid patch file (bad magic)")
 	}
 
-	// Read header_offset from last 8 bytes
 	pf.Seek(-8, io.SeekEnd)
 	var headerOffset uint64
 	binary.Read(pf, binary.LittleEndian, &headerOffset)
 
-	// Read header JSON
 	pf.Seek(int64(headerOffset), io.SeekStart)
 	fi, _ := pf.Stat()
 	headerLen := fi.Size() - 8 - int64(headerOffset)
@@ -408,7 +367,6 @@ func readPatchHeader(pf *os.File) PatchHeader {
 		fatal("error parsing patch header: %v", err)
 	}
 
-	// Seek back to start of entries (right after magic)
 	pf.Seek(int64(len(patchMagic)), io.SeekStart)
 	return header
 }
@@ -439,11 +397,9 @@ var digestCmd = &cobra.Command{
 		path := args[0]
 		start := time.Now()
 
-		src := openBlockSource(ctx, path, digestBS, digestWorkers, false)
-		defer src.cleanup()
-
-		results := hashBlocks(ctx, src.blocks, digestWorkers)
-		fileSize := src.getSize()
+		blocks, getSize := readBlocks(ctx, path, digestBS, digestWorkers)
+		results := processBlocks(ctx, blocks, digestWorkers, nil)
+		fileSize := getSize()
 
 		writeDigest(toDigestBlocks(results), digestBS, path, digestOut)
 		printStats(path, fileSize, digestBS, len(results), digestWorkers, start)
@@ -488,20 +444,17 @@ var diffCmd = &cobra.Command{
 
 		start := time.Now()
 
-		src := openBlockSource(ctx, path, diffBS, diffWorkers, true)
-		defer src.cleanup()
+		blocks, getSize := readBlocks(ctx, path, diffBS, diffWorkers)
+		opts := newDiffOpts(oldDigest, pw, diffWorkers)
+		results := processBlocks(ctx, blocks, diffWorkers, opts)
+		fileSize := getSize()
 
-		results := hashBlocks(ctx, src.blocks, diffWorkers)
-		fileSize := src.getSize()
-
-		changed := findChangedBlocks(results, oldDigest)
-		writeChangedToPatch(src, diffBS, fileSize, changed, pw)
 		pw.finalize()
 
 		writeDigest(toDigestBlocks(results), diffBS, path, diffOut)
 		printStats(path, fileSize, diffBS, len(results), diffWorkers, start)
 		fmt.Fprintf(os.Stderr, "changed blocks: %d / %d (%.1f%%)\n",
-			len(changed), len(results), float64(len(changed))/float64(len(results))*100)
+			opts.changed, len(results), float64(opts.changed)/float64(len(results))*100)
 	},
 }
 
