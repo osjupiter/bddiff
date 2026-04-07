@@ -157,50 +157,12 @@ func readBlocksFromStream(ctx context.Context, r io.Reader, blockSize int64) (ch
 	}
 }
 
-// --- hash + diff pipeline ---
-
-type patchEntry struct {
-	offset int64
-	data   []byte
-}
-
-// diffOpts enables inline diff during hashing. When set, workers compare
-// the block hash against oldDigest and send changed blocks to patchCh.
-// A separate goroutine drains patchCh and writes to the patchWriter.
-type diffOpts struct {
-	oldDigest map[int64]string
-	pw        *patchWriter
-	patchCh   chan patchEntry
-	patchDone sync.WaitGroup
-	changed   int
-}
-
-func newDiffOpts(oldDigest map[int64]string, pw *patchWriter, bufSize int) *diffOpts {
-	opts := &diffOpts{
-		oldDigest: oldDigest,
-		pw:        pw,
-		patchCh:   make(chan patchEntry, bufSize),
-	}
-	opts.patchDone.Add(1)
-	go func() {
-		defer opts.patchDone.Done()
-		for e := range opts.patchCh {
-			pw.writeEntry(e.offset, e.data)
-			opts.changed++
-		}
-	}()
-	return opts
-}
-
-func (opts *diffOpts) close() {
-	close(opts.patchCh)
-	opts.patchDone.Wait()
-}
+// --- hash pipeline ---
 
 // processBlocks hashes blocks from the channel.
-// If opts is non-nil, workers also compare hashes and send changed blocks
-// to a separate patch-writing goroutine via channel.
-func processBlocks(ctx context.Context, blocks chan block, workers int, opts *diffOpts) []hashResult {
+// If pw is non-nil, workers also compare hashes against pw.oldDigest
+// and send changed blocks to pw for writing via its internal channel.
+func processBlocks(ctx context.Context, blocks chan block, workers int, pw *patchWriter) []hashResult {
 	resultsCh := make(chan hashResult, workers)
 
 	var wg sync.WaitGroup
@@ -212,11 +174,8 @@ func processBlocks(ctx context.Context, blocks chan block, workers int, opts *di
 				h := md5.Sum(b.data)
 				hash := hex.EncodeToString(h[:])
 
-				if opts != nil {
-					oldHash, ok := opts.oldDigest[b.offset]
-					if !ok || oldHash != hash {
-						opts.patchCh <- patchEntry{offset: b.offset, data: b.data}
-					}
+				if pw != nil {
+					pw.submitIfChanged(b.offset, hash, b.data)
 				}
 
 				resultsCh <- hashResult{
@@ -242,8 +201,8 @@ func processBlocks(ctx context.Context, blocks chan block, workers int, opts *di
 	close(resultsCh)
 	collectorWg.Wait()
 
-	if opts != nil {
-		opts.close()
+	if pw != nil {
+		pw.closeInput()
 	}
 
 	if ctx.Err() != nil {
@@ -320,22 +279,58 @@ func writeDigest(blocks []DigestBlock, blockSize int64, path string, outFile str
 //   header JSON         (variable length)
 //   header_offset       (uint64 LE — position where header JSON starts)
 
+type patchEntry struct {
+	offset int64
+	data   []byte
+}
+
+// patchWriter writes a BDPATCH3 file. When oldDigest is provided, it accepts
+// blocks via submitIfChanged() from hash workers, compares against the old digest,
+// and writes changed blocks through an internal channel to a dedicated goroutine.
 type patchWriter struct {
 	f         *os.File
 	blockSize int64
+	oldDigest map[int64]string
+	ch        chan patchEntry
+	done      sync.WaitGroup
 	count     int
 }
 
-func newPatchWriter(f *os.File, blockSize int64) *patchWriter {
+func newPatchWriter(f *os.File, blockSize int64, oldDigest map[int64]string, bufSize int) *patchWriter {
 	f.Write([]byte(patchMagic))
-	return &patchWriter{f: f, blockSize: blockSize}
+	pw := &patchWriter{
+		f:         f,
+		blockSize: blockSize,
+		oldDigest: oldDigest,
+		ch:        make(chan patchEntry, bufSize),
+	}
+	pw.done.Add(1)
+	go func() {
+		defer pw.done.Done()
+		for e := range pw.ch {
+			binary.Write(pw.f, binary.LittleEndian, uint64(e.offset))
+			binary.Write(pw.f, binary.LittleEndian, uint32(len(e.data)))
+			pw.f.Write(e.data)
+			pw.count++
+		}
+	}()
+	return pw
 }
 
-func (pw *patchWriter) writeEntry(offset int64, data []byte) {
-	binary.Write(pw.f, binary.LittleEndian, uint64(offset))
-	binary.Write(pw.f, binary.LittleEndian, uint32(len(data)))
-	pw.f.Write(data)
-	pw.count++
+// submitIfChanged compares hash against oldDigest and queues the block for
+// writing if it has changed. Called from hash workers.
+func (pw *patchWriter) submitIfChanged(offset int64, hash string, data []byte) {
+	oldHash, ok := pw.oldDigest[offset]
+	if !ok || oldHash != hash {
+		pw.ch <- patchEntry{offset: offset, data: data}
+	}
+}
+
+// closeInput signals that no more blocks will be submitted.
+// Blocks until all queued entries are written.
+func (pw *patchWriter) closeInput() {
+	close(pw.ch)
+	pw.done.Wait()
 }
 
 func (pw *patchWriter) finalize() {
@@ -440,13 +435,12 @@ var diffCmd = &cobra.Command{
 			fatal("error creating patch file: %v", err)
 		}
 		defer patchFile.Close()
-		pw := newPatchWriter(patchFile, diffBS)
+		pw := newPatchWriter(patchFile, diffBS, oldDigest, diffWorkers)
 
 		start := time.Now()
 
 		blocks, getSize := readBlocks(ctx, path, diffBS, diffWorkers)
-		opts := newDiffOpts(oldDigest, pw, diffWorkers)
-		results := processBlocks(ctx, blocks, diffWorkers, opts)
+		results := processBlocks(ctx, blocks, diffWorkers, pw)
 		fileSize := getSize()
 
 		pw.finalize()
@@ -454,7 +448,7 @@ var diffCmd = &cobra.Command{
 		writeDigest(toDigestBlocks(results), diffBS, path, diffOut)
 		printStats(path, fileSize, diffBS, len(results), diffWorkers, start)
 		fmt.Fprintf(os.Stderr, "changed blocks: %d / %d (%.1f%%)\n",
-			opts.changed, len(results), float64(opts.changed)/float64(len(results))*100)
+			pw.count, len(results), float64(pw.count)/float64(len(results))*100)
 	},
 }
 

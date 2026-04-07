@@ -62,19 +62,18 @@ func TestRoundtrip(t *testing.T) {
 	_, oldDigest, _ := loadDigest(digestPath)
 
 	pf, _ := os.Create(patchPath)
-	pw := newPatchWriter(pf, blockSize)
-	opts := newDiffOpts(oldDigest, pw, workers)
+	pw := newPatchWriter(pf, blockSize, oldDigest, workers)
 
 	blocks2, getSize2 := readBlocksFromFile(ctx, modPath, blockSize, workers)
-	results2 := processBlocks(ctx, blocks2, workers, opts)
+	results2 := processBlocks(ctx, blocks2, workers, pw)
 	if getSize2() != totalSize {
 		t.Fatalf("modified fileSize mismatch")
 	}
 	pw.finalize()
 	pf.Close()
 
-	if opts.changed != 10 {
-		t.Fatalf("changed=%d, want 10", opts.changed)
+	if pw.count != 10 {
+		t.Fatalf("changed=%d, want 10", pw.count)
 	}
 
 	writeDigest(toDigestBlocks(results2), blockSize, modPath, filepath.Join(dir, "mod.digest"))
@@ -166,16 +165,15 @@ func TestStdinDiffRoundtrip(t *testing.T) {
 	// Diff via stdin
 	patchPath := filepath.Join(dir, "stdin.patch")
 	pf, _ := os.Create(patchPath)
-	pw := newPatchWriter(pf, blockSize)
-	opts := newDiffOpts(oldDigest, pw, workers)
+	pw := newPatchWriter(pf, blockSize, oldDigest, workers)
 
 	stdinBlocks, _ := readBlocksFromStream(ctx, bytes.NewReader(modData), blockSize)
-	processBlocks(ctx, stdinBlocks, workers, opts)
+	processBlocks(ctx, stdinBlocks, workers, pw)
 	pw.finalize()
 	pf.Close()
 
-	if opts.changed != 5 {
-		t.Fatalf("changed=%d, want 5", opts.changed)
+	if pw.count != 5 {
+		t.Fatalf("changed=%d, want 5", pw.count)
 	}
 
 	// Apply and verify
@@ -194,9 +192,10 @@ func TestPatchFormat(t *testing.T) {
 	patchPath := filepath.Join(dir, "test.patch")
 
 	f, _ := os.Create(patchPath)
-	pw := newPatchWriter(f, 4096)
-	pw.writeEntry(0, []byte("hello"))
-	pw.writeEntry(4096, []byte("world"))
+	pw := newPatchWriter(f, 4096, nil, 1)
+	pw.ch <- patchEntry{offset: 0, data: []byte("hello")}
+	pw.ch <- patchEntry{offset: 4096, data: []byte("world")}
+	pw.closeInput()
 	pw.finalize()
 	f.Close()
 
